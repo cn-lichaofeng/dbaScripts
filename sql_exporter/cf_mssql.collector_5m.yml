@@ -1,0 +1,213 @@
+# A custom collector defining standard metrics for Microsoft SQL Server.
+#
+# It is required that the SQL Server user has the following permissions:
+#
+#   GRANT VIEW ANY DEFINITION TO [monitor]
+#   GRANT VIEW SERVER STATE TO [monitor]
+#   USE [msdb]
+#   GO
+#   CREATE USER [monitor] FOR LOGIN [monitor]
+#   ALTER ROLE [db_datareader] ADD MEMBER [monitor]
+#   GO
+#
+collector_name: cf_mssql_5m
+min_interval: 5m
+
+
+metrics:
+
+
+  - metric_name: cf_mssql_failed_login_attempts
+    type: gauge
+    help: 'Number of failed login attempts.'
+    values: [failed_login_attempts]
+    query: |
+      DECLARE @EngineEdition INT
+      SELECT  @EngineEdition = CONVERT(INT, SERVERPROPERTY('EngineEdition'))
+      -- 5 = 'Azure SQL Database', 8 = 'Azure SQL Managed Instance'
+      IF @EngineEdition = 5
+        BEGIN
+          select count(*) as failed_login_attempts  from sys.event_log where event_type = 'connection_failed' and start_time > DATEADD(mi,-60,GETDATE())
+        END
+      ELSE
+        BEGIN
+          DROP TABLE if exists #ErrorLog
+          DROP TABLE if exists #enum
+          CREATE TABLE #ErrorLog(LogDate DATETIME, ProcessInfo NVARCHAR(50), Text NVARCHAR(MAX) )
+          CREATE TABLE #enum(ArchiveNumber INT PRIMARY KEY, LogDate DATETIME, LogSize BIGINT )
+          DECLARE  @FailedLoginsBackfillMinutes INT = 60,@CollectFromDate DATETIME
+          SELECT  @CollectFromDate = DATEADD(mi,-@FailedLoginsBackfillMinutes,GETDATE()) 
+          INSERT INTO #enum EXEC sys.sp_enumerrorlogs
+          DECLARE @ArchiveNumber INT
+          DECLARE c1 CURSOR FAST_FORWARD LOCAL FOR SELECT ArchiveNumber FROM #enum WHERE LogDate >= @CollectFromDate
+          OPEN c1
+            WHILE 1=1
+            BEGIN
+              FETCH NEXT FROM c1 INTO @ArchiveNumber
+              IF @@FETCH_STATUS<>0
+                BREAK
+              INSERT INTO #ErrorLog EXEC sp_readerrorlog @ArchiveNumber, 1, 'Login failed' 
+            END
+          CLOSE c1
+          DEALLOCATE c1
+          SELECT	count(*) as failed_login_attempts FROM #ErrorLog WHERE LogDate >= @CollectFromDate and Text not like '%AzureSQLConnectivityChecker%'
+          DROP TABLE if exists #ErrorLog
+          DROP TABLE if exists #enum
+        END
+
+  - metric_name: cf_mssql_storage
+    type: gauge
+    help: 'Storage usage free space.'
+    key_labels:
+      - volume_mount_point
+    value_label: 'type'
+    values: [total_g, free_g]
+    query: |
+      DECLARE @SQL NVARCHAR(MAX)
+      IF SERVERPROPERTY('EngineEdition') = 5
+        BEGIN
+          SET @SQL = '
+            SELECT
+              DB_NAME() AS volume_mount_point,
+              CAST(CONVERT(bigint, DATABASEPROPERTYEX(DB_NAME(), ''MaxSizeInBytes'')) / 1024.0 / 1024 / 1024 AS decimal(10,2)) - CAST(SUM(CAST(FILEPROPERTY(name, ''SpaceUsed'') AS bigint) * 8.0 / 1024 / 1024) AS decimal(10,2)) AS free_g,
+              CAST(CONVERT(bigint, DATABASEPROPERTYEX(DB_NAME(), ''MaxSizeInBytes'')) / 1024.0 / 1024 / 1024 AS decimal(10,2)) AS total_g,
+              null as label
+            FROM sys.database_files
+            WHERE type_desc = ''ROWS''' 
+        END
+      ELSE IF SERVERPROPERTY('EngineEdition') = 8
+        BEGIN
+          SET @SQL = '
+            SELECT UPPER(dovs.volume_mount_point) AS volume_mount_point,
+              AVG(dovs.total_bytes + dovs.available_bytes)/1024/1024/1024 as total_g,
+              AVG(dovs.available_bytes)/1024/1024/1024 as free_g,
+              dovs.logical_volume_name as Label
+            FROM sys.master_files mf
+            CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) dovs
+            GROUP BY UPPER(dovs.volume_mount_point),
+              dovs.logical_volume_name'
+        END
+      ELSE
+        BEGIN
+          SET @SQL = '
+            SELECT UPPER(dovs.volume_mount_point) AS volume_mount_point,
+              AVG(dovs.total_bytes)/1024/1024/1024 as total_g,
+              AVG(dovs.available_bytes)/1024/1024/1024 as free_g,
+              dovs.logical_volume_name as Label
+            FROM sys.master_files mf
+            CROSS APPLY sys.dm_os_volume_stats(mf.database_id, mf.file_id) dovs
+            GROUP BY UPPER(dovs.volume_mount_point),
+              dovs.logical_volume_name'
+        END
+      EXEC sp_executesql @SQL
+
+  - metric_name: cf_mssql_agentjob_status
+    type: gauge
+    help: 'Status of SQL Server Agent jobs.'
+    key_labels:
+      - JobName
+      - JobStatus_desc
+    values: [JobStatus]
+    query: |
+      DECLARE @SQL NVARCHAR(MAX)
+      IF SERVERPROPERTY('EngineEdition') = 5
+        BEGIN
+          RETURN
+        END
+      ELSE
+        BEGIN
+          SET @SQL = '
+            SELECT
+              j.name AS JobName,
+              CASE h.run_status
+                WHEN 0 THEN ''Failed''
+                WHEN 1 THEN ''Succeeded''
+                WHEN 2 THEN ''Retry''
+                WHEN 3 THEN ''Canceled''
+                WHEN 4 THEN ''In Progress''
+              END AS JobStatus_desc,
+              h.run_status AS JobStatus
+          FROM msdb.dbo.sysjobs j
+          JOIN msdb.dbo.sysjobhistory h ON j.job_id = h.job_id
+          JOIN (
+            select job_id, max(instance_id) instance_id
+            from msdb.dbo.sysjobhistory
+            where step_id = 0
+            and run_date >= CONVERT(VARCHAR(8), DATEADD(day, -7, getdate()), 112)
+            group by job_id
+          ) sjh ON h.job_id = sjh.job_id and h.instance_id = sjh.instance_id'
+        END
+      EXEC sp_executesql @SQL
+
+  - metric_name: cf_mssql_wait_stats
+    type: gauge
+    help: 'Wait statistics for SQL Server.'
+    key_labels:
+      - wait_type
+    value_label: 'type'
+    values: [wait_time_ms, waiting_tasks_count, signal_wait_time_ms, resource_wait_time_ms, pct, resource_pct]
+    query: |
+      WITH Waits AS (
+          SELECT 
+              wait_type,
+              wait_time_ms,
+              waiting_tasks_count,
+              signal_wait_time_ms,
+              wait_time_ms - signal_wait_time_ms AS resource_wait_time_ms
+          FROM sys.dm_os_wait_stats
+          WHERE wait_type NOT IN (
+              N'BROKER_EVENTHANDLER', N'BROKER_RECEIVE_WAITFOR', N'BROKER_TASK_STOP',
+              N'BROKER_TO_FLUSH', N'BROKER_TRANSMITTER', N'CHECKPOINT_QUEUE',
+              N'CHKPT', N'CLR_AUTO_EVENT', N'CLR_MANUAL_EVENT', N'CLR_SEMAPHORE',
+              N'DBMIRROR_DBM_EVENT', N'DBMIRROR_EVENTS_QUEUE', N'DBMIRROR_WORKER_QUEUE',
+              N'DBMIRRORING_CMD', N'DIRTY_PAGE_POLL', N'DISPATCHER_QUEUE_SEMAPHORE',
+              N'EXECSYNC', N'FSAGENT', N'FT_IFTS_SCHEDULER_IDLE_WAIT', N'FT_IFTSHC_MUTEX',
+              N'HADR_CLUSAPI_CALL', N'HADR_FILESTREAM_IOMGR_IOCOMPLETION', N'HADR_LOGCAPTURE_WAIT',
+              N'HADR_NOTIFICATION_DEQUEUE', N'HADR_TIMER_TASK', N'HADR_WORK_QUEUE',
+              N'KSOURCE_WAKEUP', N'LAZYWRITER_SLEEP', N'LOGMGR_QUEUE',
+              N'MEMORY_ALLOCATION_EXT', N'ONDEMAND_TASK_QUEUE',
+              N'PARALLEL_REDO_DRAIN_WORKER', N'PARALLEL_REDO_LOG_CACHE', N'PARALLEL_REDO_TRAN_LIST',
+              N'PARALLEL_REDO_WORKER_SYNC', N'PARALLEL_REDO_WORKER_WAIT_WORK',
+              N'PREEMPTIVE_OS_LIBRARYOPS', N'PREEMPTIVE_OS_COMOPS', N'PREEMPTIVE_OS_CRYPTOPS',
+              N'PREEMPTIVE_OS_PIPEOPS', N'PREEMPTIVE_OS_AUTHENTICATIONOPS',
+              N'PREEMPTIVE_OS_GENERICOPS', N'PREEMPTIVE_OS_VERIFYTRUST',
+              N'PREEMPTIVE_OS_FILEOPS', N'PREEMPTIVE_OS_DEVICEOPS', N'PREEMPTIVE_OS_QUERYREGISTRY',
+              N'PREEMPTIVE_OS_WRITEFILE', N'PREEMPTIVE_OS_WRITEFILEGATHER',
+              N'PREEMPTIVE_XE_CALLBACKEXECUTE', N'PREEMPTIVE_XE_DISPATCHER',
+              N'PREEMPTIVE_XE_GETTARGETSTATE', N'PREEMPTIVE_XE_SESSIONCOMMIT',
+              N'PREEMPTIVE_XE_TARGETFINALIZE', N'PREEMPTIVE_XE_TARGETINIT',
+              N'PWAIT_ALL_COMPONENTS_INITIALIZED', N'PWAIT_DIRECTLOGCONSUMER_GETNEXT',
+              N'QDS_PERSIST_TASK_MAIN_LOOP_SLEEP', N'QDS_ASYNC_QUEUE',
+              N'QDS_CLEANUP_STALE_QUERIES_TASK_MAIN_LOOP_SLEEP',
+              N'REQUEST_FOR_DEADLOCK_SEARCH', N'RESOURCE_QUEUE', N'SERVER_IDLE_CHECK',
+              N'SLEEP_BPOOL_FLUSH', N'SLEEP_DBSTARTUP', N'SLEEP_DCOMSTARTUP',
+              N'SLEEP_MASTERDBREADY', N'SLEEP_MASTERMDREADY', N'SLEEP_MASTERUPGRADED',
+              N'SLEEP_MSDBSTARTUP', N'SLEEP_SYSTEMTASK', N'SLEEP_TEMPDBSTARTUP',
+              N'SNI_HTTP_ACCEPT', N'SP_SERVER_DIAGNOSTICS_SLEEP', N'SQLTRACE_BUFFER_FLUSH',
+              N'SQLTRACE_INCREMENTAL_FLUSH_SLEEP', N'SQLTRACE_WAIT_ENTRIES',
+              N'STARTUP_DEPENDENCY_MANAGER', N'WAIT_FOR_RESULTS', N'WAITFOR',
+              N'WAITFOR_TASKSHUTDOWN', N'WAIT_XTP_HOST_WAIT', N'WAIT_XTP_OFFLINE_CKPT_NEW_LOG',
+              N'WAIT_XTP_CKPT_CLOSE', N'XE_DISPATCHER_JOIN', N'XE_DISPATCHER_WAIT',
+              N'XE_TIMER_EVENT', N'SOS_WORK_DISPATCHER'
+          )
+      ),
+      Ranked AS (
+          SELECT 
+              wait_type,
+              waiting_tasks_count,
+              wait_time_ms,
+              signal_wait_time_ms,
+              resource_wait_time_ms,
+              ROW_NUMBER() OVER (ORDER BY wait_time_ms DESC) AS rn
+          FROM Waits
+      )
+      SELECT 
+          CASE WHEN rn <= 7 THEN wait_type ELSE N'OTHER_WAITS' END AS wait_type,
+          SUM(wait_time_ms) AS wait_time_ms,
+          SUM(waiting_tasks_count) AS waiting_tasks_count,
+          SUM(signal_wait_time_ms) AS signal_wait_time_ms,
+          SUM(resource_wait_time_ms) AS resource_wait_time_ms,
+          CAST(100.0 * SUM(wait_time_ms) / SUM(SUM(wait_time_ms)) OVER() AS DECIMAL(5,2)) AS pct,
+          CAST(100.0 * SUM(resource_wait_time_ms) / SUM(SUM(wait_time_ms)) OVER() AS DECIMAL(5,2)) AS resource_pct
+      FROM Ranked
+      GROUP BY CASE WHEN rn <= 7 THEN wait_type ELSE N'OTHER_WAITS' END 

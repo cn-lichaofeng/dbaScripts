@@ -1,0 +1,99 @@
+# A custom collector defining standard metrics for Microsoft SQL Server.
+#
+# It is required that the SQL Server user has the following permissions:
+#
+#   GRANT VIEW ANY DEFINITION TO [monitor]
+#   GRANT VIEW SERVER STATE TO [monitor]
+#   USE [msdb]
+#   GO
+#   CREATE USER [monitor] FOR LOGIN [monitor]
+#   ALTER ROLE [db_datareader] ADD MEMBER [monitor]
+#   GO
+#
+collector_name: cf_mssql_12h
+min_interval: 12h
+
+
+metrics:
+
+  - metric_name: cf_mssql_last_good_checkdb
+    type: gauge
+    help: 'Days passed since the last time CHECKDB completed successfully.'
+    key_labels:
+      - DatabaseName
+    values: [DaysSinceLastCheck]
+    query: |
+      SELECT 
+        name AS DatabaseName,
+        CASE 
+          WHEN SERVERPROPERTY('EngineEdition') = 5 then 0
+          WHEN DATABASEPROPERTYEX(name, 'LastGoodCheckDbTime') IS NULL THEN 999
+          ELSE DATEDIFF(DAY, CONVERT(DATETIME, DATABASEPROPERTYEX(name, 'LastGoodCheckDbTime')), GETDATE())
+        END AS DaysSinceLastCheck
+      FROM sys.databases WHERE database_id != 2
+
+  - metric_name: cf_mssql_last_full_backup
+    type: gauge
+    help: 'Days passed since the last full backup.'
+    key_labels:
+      - DatabaseName
+    values: [DaysSinceLastFullBackup]
+    query: |
+      DECLARE @EngineEdition INT, @SQL NVARCHAR(MAX)
+      SELECT  @EngineEdition = CONVERT(INT, SERVERPROPERTY('EngineEdition')) -- 5 = 'Azure SQL Database', 8 = 'Azure SQL Managed Instance'
+      IF @EngineEdition = 5
+        BEGIN
+          SET @SQL = '
+            SELECT top 1
+              logical_database_name AS DatabaseName, 
+              CAST(DATEDIFF(DAY, backup_finish_date, GETDATE()) AS VARCHAR(10))  AS DaysSinceLastFullBackup
+            FROM sys.dm_database_backups  where backup_type = ''D'' order by backup_finish_date desc'
+        END
+      ELSE
+        BEGIN
+          SET @SQL = '
+            SELECT 
+              d.name AS DatabaseName,
+              CASE 
+                  WHEN MAX(CASE WHEN b.type = ''D'' THEN b.backup_finish_date END) IS NULL THEN 999
+                  ELSE CAST(DATEDIFF(DAY, MAX(CASE WHEN b.type = ''D'' THEN b.backup_finish_date END), GETDATE()) AS VARCHAR(10)) 
+              END AS DaysSinceLastFullBackup
+            FROM sys.databases d
+            LEFT JOIN msdb.dbo.backupset b 
+              ON d.name = b.database_name 
+              AND b.type IN (''D'')
+            WHERE d.database_id > 4
+              AND d.source_database_id IS NULL
+            GROUP BY d.name '
+        END
+      EXEC sp_executesql @SQL
+
+  - metric_name: cf_mssql_password_expiration
+    type: gauge
+    help: 'Days until password expiration for SQL logins.'
+    key_labels:
+      - LoginName
+      - is_expiration_checked
+      - is_disabled
+    values: [DaysUntilExpiration]
+    query: |
+      DECLARE @SQL NVARCHAR(MAX)
+      IF SERVERPROPERTY('EngineEdition') = 5
+        BEGIN
+          RETURN
+        END
+      ELSE
+        BEGIN
+          SET @SQL = '
+            SELECT 
+              name AS LoginName, 
+              is_expiration_checked,
+              is_disabled,
+              CASE 
+                  WHEN LOGINPROPERTY(name, ''DaysUntilExpiration'') IS NULL THEN 999
+                  ELSE LOGINPROPERTY(name, ''DaysUntilExpiration'')
+              END AS DaysUntilExpiration
+            FROM sys.sql_logins'
+        END
+      EXEC sp_executesql @SQL
+

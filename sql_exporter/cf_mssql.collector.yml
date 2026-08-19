@@ -1,0 +1,121 @@
+# A custom collector defining standard metrics for Microsoft SQL Server.
+#
+# It is required that the SQL Server user has the following permissions:
+#
+#   GRANT VIEW ANY DEFINITION TO [monitor]
+#   GRANT VIEW SERVER STATE TO [monitor]
+#   USE [msdb]
+#   GO
+#   CREATE USER [monitor] FOR LOGIN [monitor]
+#   ALTER ROLE [db_datareader] ADD MEMBER [monitor]
+#   GO
+#
+collector_name: cf_mssql
+
+
+metrics:
+
+  - metric_name: cf_mssql_up
+    type: gauge
+    help: 'Whether the SQL Server is up (1) or down (0).'
+    values: [up]
+    query: |
+      SELECT 1 AS up WHERE 1 = 1 OPTION (MAX_GRANT_PERCENT = 0)
+
+  - metric_name: cf_mssql_cpu
+    type: gauge
+    help: 'CPU usage percentage from last 1 hour.'
+    value_label: 'cpu'
+    values: [cpu_max, cpu_avg, cpu]
+    query: |
+      SELECT
+        max(cpu) cpu_max, avg(cpu) cpu_avg, MAX(CASE WHEN rn = 1 THEN cpu END) AS cpu
+      from
+      (
+        SELECT
+          100 - record.value('(Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') AS cpu,
+          ROW_NUMBER() OVER (ORDER BY [timestamp] DESC) AS rn
+        FROM (
+          SELECT
+            TOP 60
+            CAST(record AS XML) AS record, [timestamp]
+          FROM sys.dm_os_ring_buffers
+          WHERE ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR'
+          ORDER BY [timestamp] DESC
+        ) x
+      ) y
+
+  - metric_name: cf_mssql_blocking_sessions
+    type: gauge
+    help: 'Number of blocking sessions.'
+    values: [blocking_sessions]
+    query: |
+      SELECT count(*) blocking_sessions
+        FROM sys.dm_exec_requests
+      where blocking_session_id is not null and blocking_session_id != 0
+
+  - metric_name: cf_mssql_memory_pressure
+    type: gauge
+    help: 'Detect Memory pressure.'
+    values: [mem_pressure]
+    query: |
+      DECLARE @ms_ticks_now BIGINT = (SELECT ms_ticks FROM sys.dm_os_sys_info)
+      DECLARE @half_hour_ago_ms BIGINT = 30 * 60 * 1000
+      DECLARE @occur_count int = 0
+      SELECT @occur_count=count(*) from (
+        SELECT
+          DATEADD(ms, -1 * (@ms_ticks_now - [timestamp]), GETDATE()) AS EventTime,
+          CONVERT(xml, record).value('(/Record/ResourceMonitor/Notification)[1]', 'varchar(100)') AS Notification,
+          CONVERT(xml, record).value('(/Record/ResourceMonitor/IndicatorsProcess)[1]', 'int') AS IndicatorsProcess,
+          CONVERT(xml, record).value('(/Record/ResourceMonitor/IndicatorsSystem)[1]', 'int') AS IndicatorsSystem,
+          CONVERT(xml, record).value('(/Record/ResourceMonitor/Effect[@type="APPLY_LOWPM"]/@state)[1]', 'varchar(20)') AS ApplyLowPM_State
+        FROM sys.dm_os_ring_buffers
+        WHERE ring_buffer_type = N'RING_BUFFER_RESOURCE_MONITOR'
+          AND (@ms_ticks_now - [timestamp]) <= @half_hour_ago_ms
+      ) t
+      WHERE t.Notification = 'RESOURCE_MEMPHYSICAL_LOW'
+      OR (t.IndicatorsProcess & 2) = 2
+      OR (t.IndicatorsSystem & 2) = 2
+      OR t.ApplyLowPM_State = 'EFFECT_ON'
+      SELECT case  when @occur_count > 3 then 1 else 0 end as mem_pressure
+
+  - metric_name: cf_mssql_io_stall
+    type: gauge
+    help: ' I/O stall in milliseconds.'
+    key_labels:
+      - DatabaseName
+      - FileName
+      - FileType
+    value_label: 'io_stall_ms'
+    values: [num_of_reads, io_stall_read_ms, num_of_writes, io_stall_write_ms]
+    query: |
+      DECLARE @EngineEdition INT
+      SELECT  @EngineEdition = CONVERT(INT, SERVERPROPERTY('EngineEdition'))
+      -- 5 = 'Azure SQL Database', 8 = 'Azure SQL Managed Instance'
+      IF @EngineEdition = 5
+        BEGIN
+          SELECT
+            DB_NAME(s2.database_id) AS [DatabaseName],
+            mf.name AS [FileName],
+            mf.type_desc AS [FileType],
+            s2.num_of_reads,
+            s2.io_stall_read_ms,
+            s2.num_of_writes,
+            s2.io_stall_write_ms
+          FROM sys.dm_io_virtual_file_stats(NULL, NULL) s2
+          JOIN sys.database_files mf ON s2.file_id = mf.file_id
+        END
+      ELSE
+        BEGIN
+          SELECT
+            DB_NAME(s2.database_id) AS [DatabaseName],
+            mf.name AS [FileName],
+            mf.type_desc AS [FileType],
+            s2.num_of_reads  ,
+            s2.io_stall_read_ms ,
+            s2.num_of_writes ,
+            s2.io_stall_write_ms
+          FROM sys.dm_io_virtual_file_stats(NULL, NULL) s2
+          JOIN sys.master_files mf ON s2.database_id = mf.database_id AND s2.file_id = mf.file_id
+        END
+
